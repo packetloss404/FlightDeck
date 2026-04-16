@@ -1,0 +1,22 @@
+{
+  "name": "catppuccin_mocha",
+  "bg": "#1e1e2e",
+  "bg_highlight": "#313244",
+  "fg": "#cdd6f4",
+  "fg_dim": "#6c7086",
+  "fg_muted": "#45475a",
+  "fg_faint": "#313244",
+  "border": "#45475a",
+  "accent": "#cba6f7",
+  "brand": "#a6e3a1",
+  "status_active": "#89b4fa",
+  "status_done": "#a6e3a1",
+  "status_failed": "#f38ba8",
+  "status_paused": "#f9e2af",
+  "status_review": "#cba6f7",
+  "status_draft": "#6c7086",
+  "status_warning": "#fab387",
+  "status_info": "#89dceb",
+  "progress_filled": "#a6e3a1",
+  "progress_empty": "#45475a"
+}

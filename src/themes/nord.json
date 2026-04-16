@@ -1,0 +1,22 @@
+{
+  "name": "nord",
+  "bg": "#2e3440",
+  "bg_highlight": "#3b4252",
+  "fg": "#d8dee9",
+  "fg_dim": "#7b88a1",
+  "fg_muted": "#4c566a",
+  "fg_faint": "#3b4252",
+  "border": "#4c566a",
+  "accent": "#b48ead",
+  "brand": "#a3be8c",
+  "status_active": "#81a1c1",
+  "status_done": "#a3be8c",
+  "status_failed": "#bf616a",
+  "status_paused": "#ebcb8b",
+  "status_review": "#b48ead",
+  "status_draft": "#7b88a1",
+  "status_warning": "#d08770",
+  "status_info": "#88c0d0",
+  "progress_filled": "#a3be8c",
+  "progress_empty": "#4c566a"
+}

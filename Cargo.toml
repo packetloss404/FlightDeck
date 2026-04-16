@@ -1,0 +1,43 @@
+[package]
+name = "flightdeck"
+version = "0.1.0"
+description = "Terminal-native mission control for AI coding agents"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "flightdeck"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async + runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Tracing / logs
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+portable-pty = "0.8"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+regex = "1"
+fuzzy-matcher = "0.3"
+dirs = "5"
+glob = "0.3"
+
+# Secrets (for API key retrieval when agent configs reference keyring)
+keyring = { version = "3", features = ["sync-secret-service", "windows-native", "apple-native"] }
+zeroize = "1"

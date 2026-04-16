@@ -1,0 +1,22 @@
+{
+  "name": "gruvbox_dark",
+  "bg": "#1d2021",
+  "bg_highlight": "#3c3836",
+  "fg": "#ebdbb2",
+  "fg_dim": "#928374",
+  "fg_muted": "#665c54",
+  "fg_faint": "#504945",
+  "border": "#504945",
+  "accent": "#d3869b",
+  "brand": "#b8bb26",
+  "status_active": "#83a598",
+  "status_done": "#b8bb26",
+  "status_failed": "#fb4934",
+  "status_paused": "#fabd2f",
+  "status_review": "#d3869b",
+  "status_draft": "#928374",
+  "status_warning": "#fe8019",
+  "status_info": "#8ec07c",
+  "progress_filled": "#b8bb26",
+  "progress_empty": "#504945"
+}

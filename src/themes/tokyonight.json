@@ -1,0 +1,22 @@
+{
+  "name": "tokyonight",
+  "bg": "#1a1b26",
+  "bg_highlight": "#292e42",
+  "fg": "#c0caf5",
+  "fg_dim": "#565f89",
+  "fg_muted": "#3b4261",
+  "fg_faint": "#292e42",
+  "border": "#3b4261",
+  "accent": "#bb9af7",
+  "brand": "#7aa2f7",
+  "status_active": "#7aa2f7",
+  "status_done": "#9ece6a",
+  "status_failed": "#f7768e",
+  "status_paused": "#e0af68",
+  "status_review": "#bb9af7",
+  "status_draft": "#565f89",
+  "status_warning": "#e0af68",
+  "status_info": "#7dcfff",
+  "progress_filled": "#9ece6a",
+  "progress_empty": "#3b4261"
+}
