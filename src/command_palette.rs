@@ -230,10 +230,16 @@ pub fn build_commands(
 ) -> Vec<CommandEntry> {
     let mut cmds = vec![
         CommandEntry {
-            id: "nav.dashboard",
-            label: "Go to Dashboard".to_string(),
+            id: "nav.agent",
+            label: "Go to Agent".to_string(),
             category: "Navigation",
             shortcut: Some("1"),
+        },
+        CommandEntry {
+            id: "nav.dashboard",
+            label: "Go to Flight Deck".to_string(),
+            category: "Navigation",
+            shortcut: Some("Ctrl+F"),
         },
         CommandEntry {
             id: "nav.sessions",
@@ -248,16 +254,52 @@ pub fn build_commands(
             shortcut: Some("3"),
         },
         CommandEntry {
+            id: "nav.providers",
+            label: "Go to Providers".to_string(),
+            category: "Navigation",
+            shortcut: None,
+        },
+        CommandEntry {
             id: "nav.settings",
             label: "Go to Settings".to_string(),
             category: "Navigation",
             shortcut: Some("4"),
         },
         CommandEntry {
+            id: "provider.add",
+            label: "Add LLM Provider".to_string(),
+            category: "Provider",
+            shortcut: None,
+        },
+        CommandEntry {
+            id: "provider.edit",
+            label: "Edit Selected Provider".to_string(),
+            category: "Provider",
+            shortcut: None,
+        },
+        CommandEntry {
+            id: "provider.delete",
+            label: "Delete Selected Provider".to_string(),
+            category: "Provider",
+            shortcut: None,
+        },
+        CommandEntry {
+            id: "provider.test",
+            label: "Test Selected Provider Connection".to_string(),
+            category: "Provider",
+            shortcut: None,
+        },
+        CommandEntry {
             id: "flight.create",
             label: "Create New Flight".to_string(),
             category: "Flight",
             shortcut: Some("c"),
+        },
+        CommandEntry {
+            id: "agent.clear",
+            label: "Clear Agent Conversation".to_string(),
+            category: "Agent",
+            shortcut: Some("Ctrl+L"),
         },
         CommandEntry {
             id: "git.refresh",

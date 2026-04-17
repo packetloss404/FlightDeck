@@ -22,7 +22,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Span::raw("  "),
             installed_indicator,
             Span::styled(format!("{:<20}", agent.name), name_style),
-            Span::styled(format!("  {:<12}", agent.command), Style::default().fg(theme.accent)),
+            Span::styled(format!("  {:<12}", agent.display_command()), Style::default().fg(theme.accent)),
             Span::styled(
                 &agent.description,
                 Style::default().fg(theme.fg_dim),

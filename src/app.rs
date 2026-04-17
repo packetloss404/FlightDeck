@@ -12,13 +12,20 @@ use crate::core::agent;
 use crate::core::agent_config::AgentConfig;
 use crate::core::flight::*;
 use crate::core::git;
+use crate::core::native::chat::{self, ApprovalQuery, ChatEvent, ChatTurnRequest};
+use crate::core::native::conversation::Conversation;
+use crate::core::native::provider::anthropic::AnthropicProvider;
+use crate::core::native::tool::ToolRegistry;
 use crate::core::orchestrator::{Orchestrator, OrchestratorSettings};
+use crate::core::provider_config::{self, ProviderConfig};
 use crate::core::pty::{PtyEvent, PtyManager};
 use crate::core::storage::{self, PersistedState, PersistedUiState};
 
 use super::command_palette::{self, CommandPalette};
 use super::theme::Theme;
 use super::views;
+use super::views::agent::{AgentAction, AgentViewState};
+use super::views::providers::{ProvidersAction, ProvidersViewState};
 use super::widgets::diff::{self, DiffFile, DiffViewState};
 use super::widgets::help::HelpOverlay;
 use super::widgets::toast::{ToastManager, ToastLevel};
@@ -27,11 +34,13 @@ const SESSION_BUFFER_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppView {
+    Agent,
     Dashboard,
     FlightDetail(String),
     FlightEditor,
     Sessions,
     Agents,
+    Providers,
     Settings,
 }
 
@@ -245,6 +254,16 @@ pub struct App {
     pub session_search_index: usize,
     pub help_overlay: HelpOverlay,
     pub retrospectives: Vec<storage::FlightRetrospective>,
+    pub providers: Vec<ProviderConfig>,
+    pub providers_view: ProvidersViewState,
+    pub agent_view: AgentViewState,
+    pub agent_conversation: Arc<Mutex<Conversation>>,
+    pub chat_events_tx: tokio::sync::mpsc::UnboundedSender<ChatEvent>,
+    chat_events_rx: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
+    pub approval_tx: tokio::sync::mpsc::UnboundedSender<ApprovalQuery>,
+    approval_rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalQuery>,
+    /// The approval query the user is currently being asked about, if any.
+    pub pending_approval: Option<ApprovalQuery>,
     suppressed_exit_sessions: HashSet<String>,
 }
 
@@ -267,8 +286,27 @@ impl App {
             }
         }
 
+        let providers = provider_config::load_providers();
+        let default_provider = providers.iter().find(|p| p.enabled).map(|p| p.id.clone());
+        let default_model = providers
+            .iter()
+            .find(|p| Some(&p.id) == default_provider.as_ref())
+            .map(|p| p.default_model.clone());
+
+        let mut agent_view = AgentViewState::default();
+        agent_view.selected_provider_id = default_provider;
+        agent_view.selected_model = default_model;
+
+        let project_path = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+
+        let (chat_events_tx, chat_events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalQuery>();
+
         Self {
-            view: AppView::Dashboard,
+            view: AppView::Agent,
             flights,
             agents: all_agents,
             settings,
@@ -300,13 +338,28 @@ impl App {
             session_search_index: 0,
             help_overlay: HelpOverlay::new(),
             retrospectives: Vec::new(),
+            providers,
+            providers_view: ProvidersViewState::default(),
+            agent_view,
+            agent_conversation: Arc::new(Mutex::new(Conversation::new(project_path))),
+            chat_events_tx,
+            chat_events_rx,
+            approval_tx,
+            approval_rx,
+            pending_approval: None,
             suppressed_exit_sessions: HashSet::new(),
         }
     }
 
     pub fn detect_agents(&mut self) {
         for a in &mut self.agents {
-            a.installed = agent::detect_agent(&a.command);
+            // PTY agents are "installed" when the shell command resolves on PATH.
+            // Native agents have their own readiness definition (provider configured
+            // with a valid API key) — wired in a later step; leave `installed` alone.
+            if let Some(pty) = a.pty_spec() {
+                let command = pty.command.clone();
+                a.installed = agent::detect_agent(&command);
+            }
         }
         let _ = self.persist_state();
     }
@@ -320,11 +373,13 @@ impl App {
             ui: PersistedUiState {
                 selected_flight_id: self.flights.get(self.selected_flight_idx).map(|flight| flight.id.clone()),
                 selected_view: Some(match &self.view {
+                    AppView::Agent => "agent",
                     AppView::Dashboard => "dashboard",
                     AppView::FlightDetail(_) => "flight_detail",
                     AppView::FlightEditor => "flight_editor",
                     AppView::Sessions => "sessions",
                     AppView::Agents => "agents",
+                    AppView::Providers => "providers",
                     AppView::Settings => "settings",
                 }.to_string()),
                 theme: Some(self.theme.name.clone()),
@@ -372,6 +427,19 @@ impl App {
             return false;
         }
 
+        // Ctrl+F toggles between the Agent view and the Flight Deck overlay.
+        // Only intercept globally when we're NOT in the agent view (the agent
+        // view's own handler also maps Ctrl+F → Dashboard so the toggle works
+        // both directions without fighting input focus).
+        if key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(self.view, AppView::Agent)
+            && !self.is_text_input_active()
+        {
+            self.view = AppView::Agent;
+            return false;
+        }
+
         // Leader key handling — Space or Ctrl+X starts, next key within 1s triggers combo
         if let Some(started) = self.leader_pending {
             self.leader_pending = None;
@@ -393,11 +461,13 @@ impl App {
         }
 
         match &self.view {
+            AppView::Agent => self.handle_agent_view_key(key),
             AppView::Dashboard => self.handle_dashboard_key(key),
             AppView::FlightDetail(_) => self.handle_detail_key(key),
             AppView::FlightEditor => self.handle_flight_editor_key(key),
             AppView::Sessions => self.handle_sessions_key(key),
             AppView::Agents => self.handle_agents_key(key),
+            AppView::Providers => self.handle_providers_key(key),
             AppView::Settings => self.handle_settings_key(key),
         }
     }
@@ -437,11 +507,13 @@ impl App {
 
     fn view_name(&self) -> &'static str {
         match &self.view {
+            AppView::Agent => "agent",
             AppView::Dashboard => "dashboard",
             AppView::FlightDetail(_) => "flight_detail",
             AppView::FlightEditor => "flight_editor",
             AppView::Sessions => "sessions",
             AppView::Agents => "agents",
+            AppView::Providers => "providers",
             AppView::Settings => "settings",
         }
     }
@@ -476,10 +548,43 @@ impl App {
 
     fn execute_palette_command(&mut self, cmd_id: &str) {
         match cmd_id {
+            "nav.agent" => self.view = AppView::Agent,
             "nav.dashboard" => self.view = AppView::Dashboard,
             "nav.sessions" => self.view = AppView::Sessions,
             "nav.agents" => self.view = AppView::Agents,
+            "nav.providers" => self.view = AppView::Providers,
             "nav.settings" => self.view = AppView::Settings,
+            "agent.clear" => self.apply_agent_action(AgentAction::ClearConversation),
+            "provider.add" => {
+                self.view = AppView::Providers;
+                self.providers_view.mode = super::views::providers::ProvidersMode::Form(
+                    super::views::providers::ProviderForm::new_add(),
+                );
+                self.providers_view.last_status = None;
+            }
+            "provider.edit" => {
+                self.view = AppView::Providers;
+                if let Some(existing) = self.providers.get(self.providers_view.selected_idx) {
+                    self.providers_view.mode = super::views::providers::ProvidersMode::Form(
+                        super::views::providers::ProviderForm::new_edit(existing),
+                    );
+                    self.providers_view.last_status = None;
+                }
+            }
+            "provider.delete" => {
+                self.view = AppView::Providers;
+                if let Some(existing) = self.providers.get(self.providers_view.selected_idx) {
+                    self.providers_view.mode =
+                        super::views::providers::ProvidersMode::ConfirmDelete(existing.id.clone());
+                }
+            }
+            "provider.test" => {
+                self.view = AppView::Providers;
+                if let Some(existing) = self.providers.get(self.providers_view.selected_idx) {
+                    let action = ProvidersAction::TestStored(existing.id.clone());
+                    self.apply_providers_action(action);
+                }
+            }
             "flight.create" => self.start_create_flight(),
             "flight.launch" => {
                 if let Some(f) = self.flights.get_mut(self.selected_flight_idx) {
@@ -876,6 +981,208 @@ impl App {
         false
     }
 
+    fn handle_agent_view_key(&mut self, key: KeyEvent) -> bool {
+        // Pending-approval banner steals input until the user resolves it.
+        if self.pending_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('a') => {
+                    self.resolve_pending_approval(true);
+                    return false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Esc => {
+                    self.resolve_pending_approval(false);
+                    return false;
+                }
+                _ => return false, // swallow all other keys while pending
+            }
+        }
+
+        // Ctrl+F → flip to Flight Deck overlay (Dashboard + Flight views).
+        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.view = AppView::Dashboard;
+            return false;
+        }
+        // Number keys are only nav shortcuts when the input buffer is empty so
+        // typing "1" inside a message doesn't yank the user away.
+        if self.agent_view.input.is_empty()
+            && self.agent_view.focus == super::views::agent::AgentFocus::Input
+        {
+            match key.code {
+                KeyCode::Char('2') if key.modifiers.is_empty() => {
+                    self.view = AppView::Dashboard;
+                    return false;
+                }
+                KeyCode::Char('3') if key.modifiers.is_empty() => {
+                    self.view = AppView::Sessions;
+                    return false;
+                }
+                KeyCode::Char('4') if key.modifiers.is_empty() => {
+                    self.view = AppView::Settings;
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        let action = super::views::agent::handle_key(&mut self.agent_view, key);
+        self.apply_agent_action(action);
+        false
+    }
+
+    fn apply_agent_action(&mut self, action: AgentAction) {
+        match action {
+            AgentAction::None => {}
+            AgentAction::SendUserMessage(text) => {
+                if self.agent_view.running {
+                    // A turn is already in flight — ignore for now. Step 7 will add queuing.
+                    return;
+                }
+                self.launch_chat_turn(text);
+            }
+            AgentAction::SelectProvider(id) => {
+                self.agent_view.selected_model = self
+                    .providers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.default_model.clone());
+                self.agent_view.selected_provider_id = Some(id);
+            }
+            AgentAction::SelectModel(model) => {
+                self.agent_view.selected_model = Some(model);
+            }
+            AgentAction::InterruptTurn => {
+                // Best-effort: mark no-longer-running. The spawned thread will
+                // still finish its current provider call; step 7 adds a real
+                // cancellation channel.
+                self.agent_view.running = false;
+                self.agent_view.current_tool = None;
+            }
+            AgentAction::ClearConversation => {
+                let project = self.agent_conversation.lock().unwrap().project_path.clone();
+                *self.agent_conversation.lock().unwrap() = Conversation::new(project);
+                self.agent_view.scroll_offset = 0;
+                self.agent_view.user_scrolled = false;
+                self.agent_view.last_error = None;
+            }
+            AgentAction::ScrollUp => {
+                self.agent_view.scroll_offset = self.agent_view.scroll_offset.saturating_sub(1);
+            }
+            AgentAction::ScrollDown => {
+                self.agent_view.scroll_offset = self.agent_view.scroll_offset.saturating_add(1);
+                self.agent_view.user_scrolled = false;
+            }
+        }
+    }
+
+    fn launch_chat_turn(&mut self, user_message: String) {
+        let provider_id = match &self.agent_view.selected_provider_id {
+            Some(id) => id.clone(),
+            None => {
+                self.agent_view.last_error =
+                    Some("No provider configured — press Ctrl+P then :provider add".into());
+                return;
+            }
+        };
+        let cfg = match self.providers.iter().find(|p| p.id == provider_id).cloned() {
+            Some(c) => c,
+            None => {
+                self.agent_view.last_error = Some(format!("provider {} not found", provider_id));
+                return;
+            }
+        };
+        let api_key = match provider_config::get_api_key(&provider_id) {
+            Ok(k) => k,
+            Err(e) => {
+                self.agent_view.last_error = Some(format!("keyring read failed: {}", e));
+                return;
+            }
+        };
+
+        let model = self
+            .agent_view
+            .selected_model
+            .clone()
+            .unwrap_or_else(|| cfg.default_model.clone());
+
+        let provider = Arc::new(AnthropicProvider::new(api_key, cfg.base_url.clone()));
+        let registry = Arc::new(ToolRegistry::defaults());
+        let project_path = std::path::PathBuf::from(
+            self.agent_conversation.lock().unwrap().project_path.clone(),
+        );
+
+        let req = ChatTurnRequest {
+            user_message,
+            provider,
+            registry,
+            model,
+            tool_allowlist: vec![
+                "read".into(),
+                "write".into(),
+                "edit".into(),
+                "bash".into(),
+                "grep".into(),
+                "glob".into(),
+            ],
+            project_path,
+            approvals: Some(self.approval_tx.clone()),
+        };
+
+        self.agent_view.running = true;
+        self.agent_view.last_error = None;
+        self.agent_view.current_tool = None;
+
+        chat::spawn_chat_turn(
+            self.agent_conversation.clone(),
+            req,
+            self.chat_events_tx.clone(),
+        );
+    }
+
+    /// Drain queued chat events and update agent view state. Called each tick
+    /// from the main loop.
+    pub fn poll_chat_events(&mut self) {
+        loop {
+            match self.chat_events_rx.try_recv() {
+                Ok(ChatEvent::TextDelta { .. }) | Ok(ChatEvent::ReasoningDelta { .. }) => {
+                    // The view renders from the Conversation directly — nothing
+                    // to do here until we track incremental assistant-message
+                    // assembly in the agent view (out of scope for v0.2.0).
+                }
+                Ok(ChatEvent::ToolCallStarted { name, .. }) => {
+                    self.agent_view.current_tool = Some(name);
+                }
+                Ok(ChatEvent::ToolCallFinished { .. }) => {
+                    self.agent_view.current_tool = None;
+                }
+                Ok(ChatEvent::TurnComplete { .. }) => {
+                    self.agent_view.running = false;
+                    self.agent_view.current_tool = None;
+                }
+                Ok(ChatEvent::Error(msg)) => {
+                    self.agent_view.running = false;
+                    self.agent_view.current_tool = None;
+                    self.agent_view.last_error = Some(msg);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Drain one pending approval query at a time. Additional queries queue
+        // up until the user resolves the current one.
+        if self.pending_approval.is_none() {
+            if let Ok(query) = self.approval_rx.try_recv() {
+                self.pending_approval = Some(query);
+            }
+        }
+    }
+
+    fn resolve_pending_approval(&mut self, approved: bool) {
+        if let Some(query) = self.pending_approval.take() {
+            let _ = query.responder.send(approved);
+        }
+    }
+
     fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => return true,
@@ -896,6 +1203,157 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn handle_providers_key(&mut self, key: KeyEvent) -> bool {
+        // `q` quits only when idle on the list; inside a form a plain `q`
+        // should be typed as a character.
+        let in_form = matches!(
+            self.providers_view.mode,
+            super::views::providers::ProvidersMode::Form(_)
+        );
+
+        if !in_form {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('1') => {
+                    self.view = AppView::Dashboard;
+                    return false;
+                }
+                KeyCode::Char('2') => {
+                    self.view = AppView::Sessions;
+                    return false;
+                }
+                KeyCode::Char('4') => {
+                    self.view = AppView::Settings;
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        let action = super::views::providers::handle_key(
+            &mut self.providers_view,
+            &self.providers,
+            key,
+        );
+        self.apply_providers_action(action);
+        false
+    }
+
+    fn apply_providers_action(&mut self, action: ProvidersAction) {
+        match action {
+            ProvidersAction::None => {}
+            ProvidersAction::SaveNew {
+                id,
+                kind,
+                display_name,
+                default_model,
+                base_url,
+                enabled,
+                mut api_key,
+            } => {
+                if let Err(e) = provider_config::set_api_key(&id, &api_key) {
+                    self.providers_view.last_status = Some((false, format!("keyring write failed: {}", e)));
+                    api_key.clear();
+                    return;
+                }
+                api_key.clear();
+
+                let cfg = ProviderConfig {
+                    id: id.clone(),
+                    kind,
+                    display_name,
+                    base_url,
+                    default_model,
+                    enabled,
+                };
+                self.providers.push(cfg);
+                if let Err(e) = provider_config::save_providers(&self.providers) {
+                    self.providers_view.last_status = Some((false, format!("save failed: {}", e)));
+                } else {
+                    self.providers_view.last_status = Some((true, format!("added {}", id)));
+                }
+            }
+            ProvidersAction::SaveEdit {
+                id,
+                display_name,
+                default_model,
+                base_url,
+                enabled,
+                replacement_api_key,
+            } => {
+                if let Some(mut new_key) = replacement_api_key {
+                    if let Err(e) = provider_config::set_api_key(&id, &new_key) {
+                        self.providers_view.last_status = Some((false, format!("keyring write failed: {}", e)));
+                        new_key.clear();
+                        return;
+                    }
+                    new_key.clear();
+                }
+
+                if let Some(cfg) = self.providers.iter_mut().find(|p| p.id == id) {
+                    cfg.display_name = display_name;
+                    cfg.default_model = default_model;
+                    cfg.base_url = base_url;
+                    cfg.enabled = enabled;
+                }
+                if let Err(e) = provider_config::save_providers(&self.providers) {
+                    self.providers_view.last_status = Some((false, format!("save failed: {}", e)));
+                } else {
+                    self.providers_view.last_status = Some((true, format!("updated {}", id)));
+                }
+            }
+            ProvidersAction::Delete(id) => {
+                let _ = provider_config::delete_api_key(&id);
+                self.providers.retain(|p| p.id != id);
+                if self.providers_view.selected_idx >= self.providers.len() && !self.providers.is_empty() {
+                    self.providers_view.selected_idx = self.providers.len() - 1;
+                }
+                if let Err(e) = provider_config::save_providers(&self.providers) {
+                    self.providers_view.last_status = Some((false, format!("save failed: {}", e)));
+                } else {
+                    self.providers_view.last_status = Some((true, format!("deleted {}", id)));
+                }
+            }
+            ProvidersAction::TestStored(id) => {
+                let cfg = match self.providers.iter().find(|p| p.id == id).cloned() {
+                    Some(c) => c,
+                    None => {
+                        self.providers_view.last_status = Some((false, "provider not found".into()));
+                        return;
+                    }
+                };
+                let key = match provider_config::get_api_key(&id) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.providers_view.last_status = Some((false, format!("keyring read failed: {}", e)));
+                        return;
+                    }
+                };
+                let result = provider_config::test_connection(
+                    cfg.kind,
+                    cfg.base_url.as_deref(),
+                    &key,
+                );
+                self.providers_view.last_status = Some((
+                    result.ok,
+                    if result.ok {
+                        match result.model_count {
+                            Some(n) => format!("OK — {} models available", n),
+                            None => result.message,
+                        }
+                    } else {
+                        result.message
+                    },
+                ));
+            }
+            ProvidersAction::TestWithKey { kind, base_url, mut api_key } => {
+                let result = provider_config::test_connection(kind, base_url.as_deref(), &api_key);
+                api_key.clear();
+                self.providers_view.last_status = Some((result.ok, result.message));
+            }
+        }
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) -> bool {
@@ -1685,61 +2143,131 @@ impl App {
     }
 
     pub fn orchestrator_tick(&mut self) {
-        let requests = self.orchestrator.tick(&self.flights, &self.agents);
+        use crate::core::orchestrator::TaskDispatch;
 
-        for req in &requests {
-            let session_id = {
-                let mut mgr = match self.pty_manager.lock() {
-                    Ok(mgr) => mgr,
-                    Err(_) => continue,
-                };
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                match mgr.create_session(&req.project_path, cols, rows, &req.command, &req.args) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(task_id = %req.task_id, error = %e, "Failed to spawn agent");
-                        continue;
+        let dispatches = self.orchestrator.tick(&self.flights, &self.agents);
+        let had_work = !dispatches.is_empty();
+
+        for dispatch in &dispatches {
+            match dispatch {
+                TaskDispatch::Pty(req) => {
+                    let session_id = {
+                        let mut mgr = match self.pty_manager.lock() {
+                            Ok(mgr) => mgr,
+                            Err(_) => continue,
+                        };
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                        match mgr.create_session(&req.project_path, cols, rows, &req.command, &req.args) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::error!(task_id = %req.task_id, error = %e, "Failed to spawn agent");
+                                continue;
+                            }
+                        }
+                    };
+
+                    self.ensure_session_buffer(
+                        &req.flight_id,
+                        &req.milestone_id,
+                        &req.task_id,
+                        &req.agent_config_id,
+                        &req.project_path,
+                        &session_id,
+                    );
+
+                    self.orchestrator.record_spawn(&session_id, req, &mut self.flights);
+
+                    if let Ok(mut mgr) = self.pty_manager.lock() {
+                        let _ = mgr.write(&session_id, &format!("{}\n", req.prompt));
                     }
                 }
-            };
-
-            self.ensure_session_buffer(req, &session_id);
-
-            self.orchestrator.record_spawn(&session_id, req, &mut self.flights);
-
-            if let Ok(mut mgr) = self.pty_manager.lock() {
-                let _ = mgr.write(&session_id, &format!("{}\n", req.prompt));
+                TaskDispatch::Native(req) => {
+                    self.launch_native_task(req);
+                }
             }
         }
 
-        if !requests.is_empty() {
+        if had_work {
             let _ = self.persist_state();
         }
     }
 
-    fn ensure_session_buffer(&mut self, req: &crate::core::orchestrator::TaskSpawnRequest, session_id: &str) {
+    fn launch_native_task(&mut self, req: &crate::core::native::NativeRunRequest) {
+        let runner_config = match crate::core::native::runner::load_runner_config(
+            &req.provider_id,
+            &self.providers,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    task_id = %req.task_id,
+                    provider_id = %req.provider_id,
+                    error = %e,
+                    "native runner config load failed"
+                );
+                return;
+            }
+        };
+
+        let session_id = format!("native-{}", uuid::Uuid::new_v4().simple());
+
+        self.ensure_session_buffer(
+            &req.flight_id,
+            &req.milestone_id,
+            &req.task_id,
+            &req.agent_config_id,
+            &req.project_path,
+            &session_id,
+        );
+
+        self.orchestrator
+            .record_native_spawn(&session_id, req, &mut self.flights);
+
+        let pty_tx = match self.pty_manager.lock() {
+            Ok(mgr) => mgr.event_tx(),
+            Err(_) => {
+                tracing::error!(
+                    task_id = %req.task_id,
+                    "pty manager mutex poisoned; skipping native spawn"
+                );
+                return;
+            }
+        };
+
+        crate::core::native::runner::spawn(req.clone(), session_id, runner_config, pty_tx);
+    }
+
+    fn ensure_session_buffer(
+        &mut self,
+        flight_id: &str,
+        milestone_id: &str,
+        task_id: &str,
+        agent_config_id: &str,
+        project_path: &str,
+        session_id: &str,
+    ) {
         let title = self
             .flights
             .iter()
-            .find(|f| f.id == req.flight_id)
+            .find(|f| f.id == flight_id)
             .and_then(|f| {
                 f.milestones
                     .iter()
-                    .find(|ms| ms.id == req.milestone_id)
-                    .and_then(|ms| ms.tasks.iter().find(|task| task.id == req.task_id))
+                    .find(|ms| ms.id == milestone_id)
+                    .and_then(|ms| ms.tasks.iter().find(|task| task.id == task_id))
             })
             .map(|task| task.title.clone())
-            .unwrap_or_else(|| req.task_id.clone());
+            .unwrap_or_else(|| task_id.to_string());
 
         self.session_buffers.insert(
             session_id.to_string(),
             SessionBuffer {
                 session_id: session_id.to_string(),
-                flight_id: req.flight_id.clone(),
-                task_id: req.task_id.clone(),
-                agent_config_id: req.agent_config_id.clone(),
+                flight_id: flight_id.to_string(),
+                task_id: task_id.to_string(),
+                agent_config_id: agent_config_id.to_string(),
                 title,
-                project_path: req.project_path.clone(),
+                project_path: project_path.to_string(),
                 started_at: now(),
                 output: String::new(),
                 unread: false,
@@ -1960,10 +2488,16 @@ impl App {
             return;
         };
 
+        // Approval keystrokes are a PTY concept — a native agent gates tools
+        // through its own in-process runner and doesn't get here.
+        let Some(pty) = agent_config.pty_spec() else {
+            return;
+        };
+
         let payload = match action {
-            ApprovalAction::Approve => &agent_config.approval_actions.approve,
-            ApprovalAction::Deny => &agent_config.approval_actions.deny,
-            ApprovalAction::Abort => &agent_config.approval_actions.abort,
+            ApprovalAction::Approve => &pty.approval_actions.approve,
+            ApprovalAction::Deny => &pty.approval_actions.deny,
+            ApprovalAction::Abort => &pty.approval_actions.abort,
         }
         .clone();
 
@@ -2192,11 +2726,33 @@ impl App {
 
         let theme = &self.theme;
         match &self.view {
+            AppView::Agent => {
+                let conv = self.agent_conversation.lock().unwrap();
+                views::agent::render(
+                    frame,
+                    layout[1],
+                    &self.agent_view,
+                    &*conv,
+                    &self.providers,
+                    theme,
+                );
+                drop(conv);
+                if let Some(pending) = &self.pending_approval {
+                    self.render_approval_banner(frame, layout[1], pending);
+                }
+            }
             AppView::Dashboard => views::dashboard::render(frame, layout[1], self, theme),
             AppView::FlightDetail(id) => views::flight_detail::render(frame, layout[1], self, id, theme),
             AppView::FlightEditor => views::flight_editor::render(frame, layout[1], self, theme),
             AppView::Sessions => views::sessions::render(frame, layout[1], self, theme),
             AppView::Agents => views::agents::render(frame, layout[1], self, theme),
+            AppView::Providers => views::providers::render(
+                frame,
+                layout[1],
+                &self.providers_view,
+                &self.providers,
+                theme,
+            ),
             AppView::Settings => views::settings::render(frame, layout[1], self, theme),
         }
 
@@ -2295,12 +2851,21 @@ impl App {
 
     fn render_nav_bar(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
-        let tabs = vec!["1:Dashboard", "2:Sessions", "3:Agents", "4:Settings"];
+        let tabs = vec![
+            "1:Agent",
+            "2:Flight Deck",
+            "3:Sessions",
+            "Agents",
+            "Providers",
+            "4:Settings",
+        ];
         let active_idx = match &self.view {
-            AppView::Dashboard | AppView::FlightDetail(_) | AppView::FlightEditor => 0,
-            AppView::Sessions => 1,
-            AppView::Agents => 2,
-            AppView::Settings => 3,
+            AppView::Agent => 0,
+            AppView::Dashboard | AppView::FlightDetail(_) | AppView::FlightEditor => 1,
+            AppView::Sessions => 2,
+            AppView::Agents => 3,
+            AppView::Providers => 4,
+            AppView::Settings => 5,
         };
 
         let spans: Vec<Span> = tabs
@@ -2331,6 +2896,62 @@ impl App {
         frame.render_widget(bar, area);
     }
 
+    fn render_approval_banner(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        pending: &ApprovalQuery,
+    ) {
+        let t = &self.theme;
+        let width = 70u16.min(area.width.saturating_sub(4));
+        let height = 7u16.min(area.height.saturating_sub(4));
+        let x = (area.width.saturating_sub(width)) / 2 + area.x;
+        let y = area.y + area.height.saturating_sub(height).saturating_sub(5);
+        let rect = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, rect);
+
+        let block = Block::default()
+            .title(Span::styled(
+                " Approval needed ",
+                Style::default().fg(t.status_warning).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.status_warning))
+            .style(Style::default().bg(t.bg));
+
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        let summary = serde_json::to_string(&pending.input).unwrap_or_default();
+        let short: String = summary.chars().take(width.saturating_sub(8) as usize).collect();
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("tool: ", Style::default().fg(t.fg_dim)),
+                Span::styled(
+                    pending.tool_name.clone(),
+                    Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("input: ", Style::default().fg(t.fg_dim)),
+                Span::styled(short, Style::default().fg(t.fg_muted)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("[y/a] approve", Style::default().fg(t.status_done).add_modifier(Modifier::BOLD)),
+                Span::raw("     "),
+                Span::styled("[n/d/Esc] deny", Style::default().fg(t.status_warning).add_modifier(Modifier::BOLD)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let t = &self.theme;
         let running = self.orchestrator.running_tasks.len();
@@ -2342,6 +2963,23 @@ impl App {
         let total_tokens: u64 = self.flights.iter().map(|f| f.total_tokens).sum();
 
         let mut spans: Vec<Span> = Vec::new();
+
+        // Mode indicator: emphasize "Flight Deck" when in any overlay view so
+        // users know they've left the Agent surface. Ctrl+F returns them.
+        let in_flight_overlay = matches!(
+            self.view,
+            AppView::Dashboard | AppView::FlightDetail(_) | AppView::FlightEditor | AppView::Sessions
+        );
+        if in_flight_overlay {
+            spans.push(Span::styled(
+                " ⟡ Flight Deck ",
+                Style::default().fg(t.brand).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "(Ctrl+F: Agent) ",
+                Style::default().fg(t.fg_muted),
+            ));
+        }
 
         // Left: metrics
         spans.push(Span::styled(
@@ -2611,6 +3249,10 @@ fn parse_agent_runtime(
     data: &str,
     agent: &AgentConfig,
 ) -> Option<ParsedAgentRuntime> {
+    // Regex-based terminal-output parsing only makes sense for PTY agents.
+    // Native agents report their runtime state directly from the in-process runner.
+    let pty = agent.pty_spec()?;
+
     let stripped = strip_ansi(data);
     buffer.runtime_buffer.push_str(&stripped);
     if buffer.runtime_buffer.len() > 4096 {
@@ -2625,7 +3267,7 @@ fn parse_agent_runtime(
     let last_lines = &lines[start..];
     let last_chunk = last_lines.join("\n");
 
-    let needs_approval = agent
+    let needs_approval = pty
         .status_patterns
         .approval
         .iter()
@@ -2635,7 +3277,7 @@ fn parse_agent_runtime(
     let mut current_tool = None;
     let mut current_file = None;
     for line in last_lines.iter().rev() {
-        for pattern in &agent.status_patterns.tool_use {
+        for pattern in &pty.status_patterns.tool_use {
             let Ok(regex) = Regex::new(&pattern.pattern) else {
                 continue;
             };
@@ -2657,7 +3299,7 @@ fn parse_agent_runtime(
         agent_state = AgentRuntimeState::ApprovalNeeded;
     } else if current_tool.is_some() {
         agent_state = AgentRuntimeState::ToolUse;
-    } else if agent
+    } else if pty
         .status_patterns
         .thinking
         .iter()
@@ -2665,7 +3307,7 @@ fn parse_agent_runtime(
         .any(|regex| regex.is_match(&last_chunk))
     {
         agent_state = AgentRuntimeState::Thinking;
-    } else if agent
+    } else if pty
         .status_patterns
         .idle
         .iter()

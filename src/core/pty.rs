@@ -124,6 +124,12 @@ impl PtyManager {
         }
     }
 
+    /// Clone the event sender so out-of-process agents (e.g. the native
+    /// runner) can emit `PtyEvent`s into the same channel the TUI drains.
+    pub fn event_tx(&self) -> mpsc::Sender<PtyEvent> {
+        self.event_tx.clone()
+    }
+
     /// Create a new PTY session. Returns the session ID.
     pub fn create_session(
         &mut self,

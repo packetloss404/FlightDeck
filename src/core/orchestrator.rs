@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 use super::flight::*;
-use super::agent_config::AgentConfig;
+use super::agent_config::{AgentConfig, AgentKind};
+use super::native::NativeRunRequest;
 
 /// A running task tracked by the orchestrator
 #[derive(Debug, Clone)]
@@ -311,18 +312,21 @@ impl Orchestrator {
     }
 
     /// Scheduling tick: spawn agent sessions for queued tasks up to max parallel.
-    /// Returns list of (flight_id, milestone_id, task_id, command, args, prompt) to spawn.
+    ///
+    /// Returns a list of dispatches — either a PTY spawn request (existing CLI
+    /// agents) or a native run request (in-process agent). Callers in `app.rs`
+    /// match on the variant and route each to the appropriate runner.
     pub fn tick(
         &mut self,
         flights: &[Flight],
         agents: &[AgentConfig],
-    ) -> Vec<TaskSpawnRequest> {
+    ) -> Vec<TaskDispatch> {
         let available = self.settings.max_parallel_sessions.saturating_sub(self.running_tasks.len());
         if available == 0 {
             return vec![];
         }
 
-        let mut requests = Vec::new();
+        let mut dispatches = Vec::new();
         let mut slots_used = 0;
 
         for flight in flights {
@@ -344,31 +348,51 @@ impl Orchestrator {
                     if agent.is_none() { continue; }
                     let agent = agent.unwrap();
 
-                    let mut args = agent.default_args.clone();
-                    if let Some(ref agent_args) = task.agent_args {
-                        args.extend(agent_args.clone());
-                    }
-                    if let Some(ref model) = task.model {
-                        args.push("--model".to_string());
-                        args.push(model.clone());
-                    }
-
                     let prompt = format!(
                         "Flight: {}\nObjective: {}\nMilestone: {}\n\nTask: {}\n{}",
                         flight.title, flight.objective, ms.title, task.title, task.description
                     );
 
-                    requests.push(TaskSpawnRequest {
-                        flight_id: flight.id.clone(),
-                        milestone_id: ms.id.clone(),
-                        task_id: task.id.clone(),
-                        agent_config_id: agent.id.clone(),
-                        command: agent.command.clone(),
-                        args,
-                        prompt,
-                        project_path: flight.project_path.clone(),
-                    });
+                    let dispatch = match &agent.kind {
+                        AgentKind::Pty(pty) => {
+                            let mut args = pty.default_args.clone();
+                            if let Some(ref agent_args) = task.agent_args {
+                                args.extend(agent_args.clone());
+                            }
+                            if let Some(ref model) = task.model {
+                                args.push("--model".to_string());
+                                args.push(model.clone());
+                            }
 
+                            TaskDispatch::Pty(TaskSpawnRequest {
+                                flight_id: flight.id.clone(),
+                                milestone_id: ms.id.clone(),
+                                task_id: task.id.clone(),
+                                agent_config_id: agent.id.clone(),
+                                command: pty.command.clone(),
+                                args,
+                                prompt,
+                                project_path: flight.project_path.clone(),
+                            })
+                        }
+                        AgentKind::Native(native) => {
+                            let model = task.model.clone().unwrap_or_else(|| native.model.clone());
+                            TaskDispatch::Native(NativeRunRequest {
+                                flight_id: flight.id.clone(),
+                                milestone_id: ms.id.clone(),
+                                task_id: task.id.clone(),
+                                agent_config_id: agent.id.clone(),
+                                provider_id: native.provider_id.clone(),
+                                model,
+                                tool_allowlist: native.tool_allowlist.clone(),
+                                system_prompt_override: native.system_prompt_override.clone(),
+                                prompt,
+                                project_path: flight.project_path.clone(),
+                            })
+                        }
+                    };
+
+                    dispatches.push(dispatch);
                     slots_used += 1;
                 }
 
@@ -379,13 +403,50 @@ impl Orchestrator {
             }
         }
 
-        requests
+        dispatches
     }
 
     /// Record that a task has been spawned.
     pub fn record_spawn(&mut self, session_id: &str, req: &TaskSpawnRequest, flights: &mut [Flight]) {
-        if let Some(flight) = flights.iter_mut().find(|flight| flight.id == req.flight_id) {
-            if let Some((milestone_idx, task_idx)) = Self::task_position(flight, &req.task_id) {
+        self.record_spawn_ids(
+            session_id,
+            &req.flight_id,
+            &req.milestone_id,
+            &req.task_id,
+            &req.agent_config_id,
+            flights,
+        );
+    }
+
+    /// Record that a native task has been spawned. Structurally identical to
+    /// `record_spawn` but typed for the native request shape.
+    pub fn record_native_spawn(
+        &mut self,
+        session_id: &str,
+        req: &super::native::NativeRunRequest,
+        flights: &mut [Flight],
+    ) {
+        self.record_spawn_ids(
+            session_id,
+            &req.flight_id,
+            &req.milestone_id,
+            &req.task_id,
+            &req.agent_config_id,
+            flights,
+        );
+    }
+
+    fn record_spawn_ids(
+        &mut self,
+        session_id: &str,
+        flight_id: &str,
+        milestone_id: &str,
+        task_id: &str,
+        agent_config_id: &str,
+        flights: &mut [Flight],
+    ) {
+        if let Some(flight) = flights.iter_mut().find(|flight| flight.id == flight_id) {
+            if let Some((milestone_idx, task_idx)) = Self::task_position(flight, task_id) {
                 if flight.milestones[milestone_idx].status == MilestoneStatus::Pending {
                     flight.milestones[milestone_idx].status = MilestoneStatus::Active;
                 }
@@ -403,12 +464,12 @@ impl Orchestrator {
             }
         }
 
-        self.running_tasks.insert(req.task_id.to_string(), RunningTask {
-            task_id: req.task_id.to_string(),
-            milestone_id: req.milestone_id.clone(),
-            flight_id: req.flight_id.clone(),
+        self.running_tasks.insert(task_id.to_string(), RunningTask {
+            task_id: task_id.to_string(),
+            milestone_id: milestone_id.to_string(),
+            flight_id: flight_id.to_string(),
             session_id: session_id.to_string(),
-            agent_config_id: req.agent_config_id.clone(),
+            agent_config_id: agent_config_id.to_string(),
             started_at: now(),
         });
     }
@@ -430,6 +491,38 @@ pub struct TaskSpawnRequest {
     pub args: Vec<String>,
     pub prompt: String,
     pub project_path: String,
+}
+
+/// Unit of work produced by `Orchestrator::tick()` — either a PTY spawn for an
+/// external CLI agent, or a native in-process run against an LLM provider.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "dispatch", rename_all = "snake_case")]
+pub enum TaskDispatch {
+    Pty(TaskSpawnRequest),
+    Native(NativeRunRequest),
+}
+
+impl TaskDispatch {
+    pub fn flight_id(&self) -> &str {
+        match self {
+            TaskDispatch::Pty(req) => &req.flight_id,
+            TaskDispatch::Native(req) => &req.flight_id,
+        }
+    }
+
+    pub fn task_id(&self) -> &str {
+        match self {
+            TaskDispatch::Pty(req) => &req.task_id,
+            TaskDispatch::Native(req) => &req.task_id,
+        }
+    }
+
+    pub fn agent_config_id(&self) -> &str {
+        match self {
+            TaskDispatch::Pty(req) => &req.agent_config_id,
+            TaskDispatch::Native(req) => &req.agent_config_id,
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -542,28 +635,43 @@ mod tests {
     }
 
     fn sample_agent() -> AgentConfig {
+        use super::super::agent_config::{
+            AgentApprovalActions, AgentStatusPatterns, PtyAgentSpec,
+        };
         AgentConfig {
             id: "claude-code".into(),
             name: "Claude Code".into(),
-            command: "claude".into(),
-            default_args: vec!["-p".to_string()],
             description: "Test agent".into(),
             installed: true,
             capabilities: vec![],
             icon: "Bot".into(),
             color: "text-accent-purple".into(),
-            status_patterns: super::super::agent_config::AgentStatusPatterns {
-                approval: vec![],
-                thinking: vec![],
-                tool_use: vec![],
-                idle: vec![],
-            },
-            approval_actions: super::super::agent_config::AgentApprovalActions {
-                approve: "y\n".into(),
-                deny: "n\n".into(),
-                abort: "\u{3}".into(),
-            },
             is_builtin: true,
+            kind: AgentKind::Pty(PtyAgentSpec {
+                command: "claude".into(),
+                default_args: vec!["-p".to_string()],
+                status_patterns: AgentStatusPatterns {
+                    approval: vec![],
+                    thinking: vec![],
+                    tool_use: vec![],
+                    idle: vec![],
+                },
+                approval_actions: AgentApprovalActions {
+                    approve: "y\n".into(),
+                    deny: "n\n".into(),
+                    abort: "\u{3}".into(),
+                },
+            }),
+        }
+    }
+
+    /// Test helper: assert a dispatch is the PTY variant and unwrap it.
+    impl TaskDispatch {
+        fn expect_pty(&self) -> &TaskSpawnRequest {
+            match self {
+                TaskDispatch::Pty(req) => req,
+                TaskDispatch::Native(_) => panic!("expected Pty dispatch, got Native"),
+            }
         }
     }
 
@@ -623,12 +731,13 @@ mod tests {
         let mut flights = vec![flight];
 
         // Tick should return 1 spawn request for task-1
-        let requests = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].task_id, "task-1");
+        let dispatches = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches.len(), 1);
+        let req = dispatches[0].expect_pty();
+        assert_eq!(req.task_id, "task-1");
 
         // Record spawn
-        orchestrator.record_spawn("sess-1", &requests[0], &mut flights);
+        orchestrator.record_spawn("sess-1", req, &mut flights);
         assert_eq!(flights[0].milestones[0].tasks[0].status, TaskStatus::Running);
 
         // Complete task-1 successfully
@@ -638,12 +747,13 @@ mod tests {
         assert_eq!(flights[0].milestones[0].tasks[1].status, TaskStatus::Queued);
 
         // Tick again → spawn request for task-2
-        let requests2 = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests2.len(), 1);
-        assert_eq!(requests2[0].task_id, "task-2");
+        let dispatches2 = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches2.len(), 1);
+        let req2 = dispatches2[0].expect_pty();
+        assert_eq!(req2.task_id, "task-2");
 
         // Record spawn and complete task-2
-        orchestrator.record_spawn("sess-2", &requests2[0], &mut flights);
+        orchestrator.record_spawn("sess-2", req2, &mut flights);
         orchestrator.on_task_complete("task-2", true, &mut flights);
 
         assert_eq!(flights[0].milestones[0].status, MilestoneStatus::Done);
@@ -707,9 +817,9 @@ mod tests {
         orchestrator.launch_flight(&mut flight);
         let mut flights = vec![flight];
 
-        let requests = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests.len(), 1);
-        orchestrator.record_spawn("sess-1", &requests[0], &mut flights);
+        let dispatches = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches.len(), 1);
+        orchestrator.record_spawn("sess-1", dispatches[0].expect_pty(), &mut flights);
         orchestrator.on_task_complete("task-1", true, &mut flights);
 
         // ms-1 done, flight should be in Review due to milestone gating
@@ -725,10 +835,11 @@ mod tests {
         assert_eq!(flights[0].milestones[1].tasks[0].status, TaskStatus::Queued);
 
         // Tick, spawn, complete task-2
-        let requests2 = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests2.len(), 1);
-        assert_eq!(requests2[0].task_id, "task-2");
-        orchestrator.record_spawn("sess-2", &requests2[0], &mut flights);
+        let dispatches2 = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches2.len(), 1);
+        let req2 = dispatches2[0].expect_pty();
+        assert_eq!(req2.task_id, "task-2");
+        orchestrator.record_spawn("sess-2", req2, &mut flights);
         orchestrator.on_task_complete("task-2", true, &mut flights);
 
         assert_eq!(flights[0].status, FlightStatus::Done);
@@ -744,9 +855,9 @@ mod tests {
         orchestrator.launch_flight(&mut flight);
         let mut flights = vec![flight];
 
-        let requests = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests.len(), 1);
-        orchestrator.record_spawn("sess-1", &requests[0], &mut flights);
+        let dispatches = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches.len(), 1);
+        orchestrator.record_spawn("sess-1", dispatches[0].expect_pty(), &mut flights);
 
         // Complete task-1 with failure
         orchestrator.on_task_complete("task-1", false, &mut flights);
@@ -766,9 +877,9 @@ mod tests {
         orchestrator.launch_flight(&mut flight);
         let mut flights = vec![flight];
 
-        let requests = orchestrator.tick(&flights, &agents);
-        assert_eq!(requests.len(), 1);
-        orchestrator.record_spawn("sess-1", &requests[0], &mut flights);
+        let dispatches = orchestrator.tick(&flights, &agents);
+        assert_eq!(dispatches.len(), 1);
+        orchestrator.record_spawn("sess-1", dispatches[0].expect_pty(), &mut flights);
         assert_eq!(flights[0].milestones[0].tasks[0].status, TaskStatus::Running);
 
         // Cancel flight

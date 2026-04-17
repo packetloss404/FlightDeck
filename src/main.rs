@@ -111,6 +111,9 @@ fn run_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result
         // Drain PTY events
         app.poll_pty_events();
 
+        // Drain native-agent chat events
+        app.poll_chat_events();
+
         // Orchestrator tick
         app.orchestrator_tick();
 

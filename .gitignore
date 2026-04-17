@@ -2,3 +2,12 @@
 /Cargo.lock
 *.log
 .DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code — user-local settings only; settings.json (shared) is committed.
+.claude/settings.local.json
