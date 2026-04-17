@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlightDeck — Terminal-native coding agent in Rust</title>
+<meta name="description" content="FlightDeck is a Rust TUI coding agent: streaming chat, in-process tools, OS-keyring API keys, and a Flight Deck overlay for structured multi-task missions.">
+<meta property="og:title" content="FlightDeck">
+<meta property="og:description" content="A terminal-native coding agent in Rust. Chat with an in-process LLM that reads, writes, edits, and runs commands in your project — with real approval gates and safety rails.">
+<meta property="og:type" content="website">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --surface: #10151d;
+    --surface-2: #141c26;
+    --border: #1e2936;
+    --border-strong: #2a3a4f;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --faint: #5c6670;
+    --brand: #e89b4c;
+    --info: #539bf5;
+    --ok: #57ab5a;
+    --warn: #daaa3f;
+    --danger: #f47067;
+    --purple: #b392f0;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  a { color: var(--info); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, .mono { font-family: var(--mono); }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- Nav ---------- */
+  nav.top {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(11,15,20,0.85);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav.top .wrap {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 56px;
+  }
+  nav.top .logo {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+  }
+  nav.top .logo .spark { color: var(--brand); }
+  nav.top .links { display: flex; gap: 18px; font-size: 14px; color: var(--muted); }
+  nav.top .links a { color: var(--muted); }
+  nav.top .links a:hover { color: var(--text); }
+
+  /* ---------- Hero ---------- */
+  .hero { padding: 96px 0 72px; }
+  .hero h1 {
+    margin: 0 0 20px; font-size: clamp(40px, 6vw, 68px);
+    line-height: 1.05; letter-spacing: -0.02em; font-weight: 700;
+  }
+  .hero h1 .spark { color: var(--brand); }
+  .hero .tagline {
+    font-size: clamp(17px, 2vw, 20px);
+    color: var(--muted);
+    max-width: 720px;
+    margin: 0 0 32px;
+  }
+  .hero .tagline strong { color: var(--text); font-weight: 500; }
+  .hero .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 500;
+    text-decoration: none;
+    transition: transform .08s ease, background .12s ease, border-color .12s ease;
+    border: 1px solid transparent;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: var(--brand); color: #1a0f04;
+  }
+  .btn-primary:hover { background: #f0aa61; text-decoration: none; }
+  .btn-ghost {
+    background: transparent; color: var(--text); border-color: var(--border-strong);
+  }
+  .btn-ghost:hover { background: var(--surface); text-decoration: none; border-color: var(--brand); }
+
+  .badge-row { display: flex; gap: 14px; margin-top: 32px; flex-wrap: wrap; }
+  .badge {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--muted);
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--surface);
+  }
+  .badge .dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ok); margin-right: 6px; vertical-align: 1px;
+  }
+
+  /* ---------- Terminal mock ---------- */
+  .terminal-wrap { padding: 8px 0 80px; }
+  .terminal {
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .terminal .chrome {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px;
+    background: #0d1319;
+    border-bottom: 1px solid var(--border);
+  }
+  .terminal .chrome .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .terminal .chrome .dot.r { background: #ff5f57; }
+  .terminal .chrome .dot.y { background: #febc2e; }
+  .terminal .chrome .dot.g { background: #28c840; }
+  .terminal .chrome .title {
+    margin-left: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted);
+  }
+  .terminal pre {
+    margin: 0; padding: 20px 22px;
+    font-size: 13px; line-height: 1.5;
+    color: var(--text);
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .terminal .muted { color: var(--muted); }
+  .terminal .faint { color: var(--faint); }
+  .terminal .brand { color: var(--brand); }
+  .terminal .ok    { color: var(--ok); }
+  .terminal .warn  { color: var(--warn); }
+  .terminal .info  { color: var(--info); }
+  .terminal .purple { color: var(--purple); }
+  .terminal .danger { color: var(--danger); }
+
+  /* ---------- Section generics ---------- */
+  section { padding: 72px 0; border-top: 1px solid var(--border); }
+  section h2 {
+    font-size: clamp(26px, 3.2vw, 34px);
+    line-height: 1.15;
+    letter-spacing: -0.015em;
+    margin: 0 0 16px;
+    font-weight: 700;
+  }
+  section h2 .eyebrow {
+    display: block;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--brand);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 10px;
+    font-weight: 500;
+  }
+  section .lede {
+    color: var(--muted); max-width: 720px;
+    font-size: 17px; line-height: 1.6; margin: 0 0 36px;
+  }
+
+  /* ---------- Features grid ---------- */
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px 22px 20px;
+    transition: border-color .12s ease, transform .12s ease;
+  }
+  .card:hover { border-color: var(--border-strong); }
+  .card .tag {
+    display: inline-block;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--brand);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 10px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
+  .card p  { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; }
+  .card ul { margin: 10px 0 0; padding: 0 0 0 16px; color: var(--muted); font-size: 14px; }
+  .card li { margin: 4px 0; }
+
+  /* ---------- Two-column ---------- */
+  .two-col { display: grid; gap: 32px; grid-template-columns: 1fr 1fr; align-items: start; }
+  @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+  .two-col .codeblock {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  /* ---------- Keyboard / key combos ---------- */
+  kbd {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 2px 7px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text);
+    box-shadow: 0 1px 0 var(--border-strong);
+  }
+
+  /* ---------- Architecture diagram ---------- */
+  .arch {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px 26px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre;
+    overflow-x: auto;
+    color: var(--text);
+  }
+  .arch .c { color: var(--brand); }
+  .arch .m { color: var(--muted); }
+
+  /* ---------- Safety callout ---------- */
+  .callout {
+    background: linear-gradient(180deg, rgba(232,155,76,0.08), rgba(232,155,76,0.02));
+    border: 1px solid rgba(232,155,76,0.25);
+    border-left: 3px solid var(--brand);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+  .callout h3 {
+    margin: 0 0 8px; font-size: 15px;
+    color: var(--brand);
+    font-family: var(--mono);
+    letter-spacing: 0.01em;
+  }
+  .callout p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+  /* ---------- Footer ---------- */
+  footer {
+    padding: 40px 0 56px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--faint);
+    text-align: center;
+  }
+  footer a { color: var(--muted); }
+  footer .disclaimer { margin-top: 8px; max-width: 560px; margin-left: auto; margin-right: auto; }
+
+  /* ---------- Small utilities ---------- */
+  .spacer-8  { height: 8px; }
+  .spacer-16 { height: 16px; }
+  .spacer-24 { height: 24px; }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <div class="logo"><span class="spark">&#9720;</span>&nbsp;flightdeck</div>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="https://github.com/packetloss404/flightdeck">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <h1><span class="spark">Flight</span>Deck</h1>
+    <p class="tagline">
+      A terminal-native coding agent in <strong>Rust</strong>. Open it, type a request, and watch
+      an in-process LLM <strong>read, write, edit, and run commands</strong> in your project —
+      with real approval gates, doom-loop detection, and no Node/Tauri sidecar. When you need
+      structured multi-task work, <kbd>Ctrl+F</kbd> drops you into the Flight Deck overlay.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/packetloss404/flightdeck">View on GitHub &rarr;</a>
+      <a class="btn btn-ghost" href="#quickstart">Quickstart</a>
+    </div>
+    <div class="badge-row">
+      <span class="badge"><span class="dot"></span>v0.2 &mdash; main branch</span>
+      <span class="badge mono">Rust 1.70+</span>
+      <span class="badge mono">~9 MB single binary</span>
+      <span class="badge mono">73 tests, deterministic</span>
+      <span class="badge mono">Apache-2.0</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap terminal-wrap">
+  <div class="terminal" role="img" aria-label="Screenshot of the FlightDeck Agent view running in a terminal">
+    <div class="chrome">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="title">flightdeck &mdash; agent</span>
+    </div>
+<pre>
+<span class="muted">1:Agent   2:Flight Deck   3:Sessions   Agents   Providers   4:Settings</span>
+<span class="brand">flightdeck</span> <span class="muted">&middot;</span> <span class="info">Anthropic</span>/<span class="purple">claude-sonnet-4-6</span>          <span class="faint">idle</span>
+<span class="faint">────────────────────────────────────────────────────────────────────────</span>
+
+<span class="brand">user</span>
+  add a TODO.md with three things we should build next
+
+<span class="info">assistant</span>
+  I'll scan the project first, then draft a TODO that fits the gaps.
+
+  <span class="ok">&#9679;</span> Grep(<span class="purple">TODO|FIXME</span>)          <span class="faint">&rarr; 2 matches in src/app.rs</span>
+  <span class="ok">&#9679;</span> Read(<span class="purple">CLAUDE.md</span>)              <span class="faint">&rarr; 187 lines</span>
+  <span class="ok">&#9679;</span> Write(<span class="purple">TODO.md</span>)               <span class="faint">&rarr; wrote 412 bytes</span>
+
+  Done. Three items staged in <span class="purple">TODO.md</span>:
+   1. Rename legacy data dir ~/.packetcode/ &rarr; ~/.flightdeck/.
+   2. Add OpenAI provider behind the Provider trait.
+   3. Real cancellation channel for in-flight chat turns.
+
+<span class="faint">────────────────────────────────────────────────────────────────────────</span>
+<span class="brand">&gt;</span> <span class="muted">ask anything about this project...</span>                          <span class="faint">│</span>
+<span class="faint">  Enter: send   Ctrl+L: clear   Ctrl+F: Flight Deck overlay   Tab: scroll</span>
+</pre>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2><span class="eyebrow">Features</span>Two products, one binary.</h2>
+    <p class="lede">
+      FlightDeck is a coding agent first. The orchestration surface that originally shipped with
+      it &mdash; Flights composed of Milestones and Tasks &mdash; is still there, one keystroke away,
+      for when a single chat doesn't fit the shape of the work.
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <div class="tag">Native agent</div>
+        <h3>Streaming chat against your cwd</h3>
+        <p>
+          Anthropic Messages API with SSE streaming, extended thinking support, and clean
+          token-delta rendering. Text shows up as it's generated; tool calls appear inline
+          as the model decides to make them.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Tools</div>
+        <h3>Six in-process primitives</h3>
+        <p>Sandboxed to the project directory. No shell-escaping mistakes, no accidental `..`.</p>
+        <ul>
+          <li><code>read</code> &middot; line-numbered file reads</li>
+          <li><code>write</code> &middot; create / overwrite</li>
+          <li><code>edit</code> &middot; exact string replacement</li>
+          <li><code>bash</code> &middot; gated shell execution</li>
+          <li><code>grep</code> &middot; regex over the tree</li>
+          <li><code>glob</code> &middot; pattern file match</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="tag">Safety</div>
+        <h3>Approval gates &amp; doom-loop halt</h3>
+        <p>
+          <code>bash</code> and writes outside the project dir trigger a centered banner &mdash;
+          <kbd>y</kbd>/<kbd>a</kbd> approve, <kbd>n</kbd>/<kbd>d</kbd>/<kbd>Esc</kbd> deny. If the
+          model calls the same tool three times with identical input, the runner halts and feeds
+          the denial back as a tool result so it can course-correct.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Providers</div>
+        <h3>OS-keyring secrets, in-TUI setup</h3>
+        <p>
+          Add a provider from inside the TUI: paste your API key, pick a model, test against
+          <code>/v1/models</code>, save. The key lands in the OS keyring (Windows Credential
+          Manager, macOS Keychain, or libsecret on Linux). Nothing sensitive ever touches
+          <code>providers.json</code>; in-memory copies are wrapped in <code>Zeroizing&lt;String&gt;</code>.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Context</div>
+        <h3>Compaction without losing the tail</h3>
+        <p>
+          Token-budget pruner at 180k total / 40k protected tail. Older turns collapse to a
+          summary placeholder while the most recent tool results stay intact &mdash; so the model
+          keeps full fidelity where it matters.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Orchestration</div>
+        <h3>Flight Deck overlay (<kbd>Ctrl+F</kbd>)</h3>
+        <p>
+          When a single chat isn't the right shape, drop into the overlay: Flights composed of
+          Milestones composed of Tasks, each assigned to the native agent or an external CLI
+          (Claude Code, Codex, Gemini, OpenCode). Parallel execution, milestone gating,
+          review-before-continue.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">TUI</div>
+        <h3>Ratatui, keyboard-driven</h3>
+        <p>
+          Fuzzy command palette (<kbd>Ctrl+P</kbd>), context-sensitive help (<kbd>?</kbd>),
+          five built-in themes, custom themes from <code>~/.flightdeck/themes/</code>,
+          tabbed sessions, diff overlay, toast notifications.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Runtime</div>
+        <h3>Sync TUI, async agent thread</h3>
+        <p>
+          The render loop stays synchronous; each native task spawns a dedicated OS thread
+          with a current-thread Tokio runtime. Events flow back over std <code>mpsc</code>,
+          the Agent view and Sessions view pull from the same channel.
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="tag">Ship</div>
+        <h3>One binary, zero deps</h3>
+        <p>
+          No Node. No Tauri. No sidecar. <code>cargo build --release</code> produces a ~9&nbsp;MB
+          executable that runs against ConPTY on Windows or POSIX PTY elsewhere.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap two-col">
+    <div>
+      <h2><span class="eyebrow">Quickstart</span>Three commands and a key.</h2>
+      <p class="lede">
+        Requires Rust 1.70+ and a working OS keyring. First launch opens into the Agent view;
+        configure an Anthropic provider and you're streaming.
+      </p>
+      <ol style="color: var(--muted); padding-left: 18px; line-height: 1.7;">
+        <li>Clone the repo and <code>cargo build --release</code>.</li>
+        <li>Run the binary; it opens to the Agent view.</li>
+        <li>Press <kbd>Ctrl+P</kbd>, type <code>provider add</code>, paste your Anthropic key.</li>
+        <li>Back in the Agent view, type your first request and press <kbd>Enter</kbd>.</li>
+      </ol>
+      <p style="color: var(--muted); margin-top: 18px; font-size: 14.5px;">
+        State lives in <code>~/.packetcode/</code> (legacy path from the fork &mdash; will
+        migrate to <code>~/.flightdeck/</code> in a later release). API keys live in your
+        OS keyring under <code>service=flightdeck</code>, <code>account=provider:&lt;id&gt;</code>.
+      </p>
+    </div>
+    <div>
+      <div class="codeblock"><span style="color: var(--muted);"># clone + build</span>
+git clone git@github.com:packetloss404/flightdeck.git
+cd flightdeck
+cargo build --release
+
+<span style="color: var(--muted);"># run (Unix)</span>
+./target/release/flightdeck
+
+<span style="color: var(--muted);"># run (Windows)</span>
+.\target\release\flightdeck.exe
+
+<span style="color: var(--muted);"># tests (73, deterministic, no network)</span>
+cargo test</div>
+      <div class="spacer-16"></div>
+      <div class="callout">
+        <h3>Your keys stay in the keyring.</h3>
+        <p>
+          FlightDeck never writes API keys to disk in its own state files. The provider
+          registry holds metadata only; secrets go through the OS-native keyring and are
+          zeroized in memory when the form closes or the provider client drops.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <h2><span class="eyebrow">Architecture</span>One dispatch fork, one event channel.</h2>
+    <p class="lede">
+      Two agent kinds coexist cleanly. The orchestrator's <code>tick()</code> returns a
+      <code>TaskDispatch</code> enum &mdash; <code>Pty</code> for external CLIs, <code>Native</code>
+      for the in-process agent. Both emit <code>PtyEvent</code>s into the same channel the TUI
+      already drains, so the Sessions view renders both kinds identically.
+    </p>
+    <div class="arch"><span class="c">main.rs</span>              <span class="m"># event loop (50ms poll)</span>
+  &#9474;
+  &#9500;&#9472; <span class="c">app.rs</span>            <span class="m"># App state, key dispatch, event pumps, orchestrator tick</span>
+  &#9474;    &#9500;&#9472; <span class="c">views/</span>
+  &#9474;    &#9474;   &#9500;&#9472; <span class="c">agent.rs</span>       <span class="m">default &mdash; chat UI</span>
+  &#9474;    &#9474;   &#9500;&#9472; <span class="c">providers.rs</span>   <span class="m">add/edit/test API keys</span>
+  &#9474;    &#9474;   &#9492;&#9472; <span class="c">dashboard / flight_* / sessions / agents / settings</span>
+  &#9474;    &#9500;&#9472; widgets/           <span class="m">diff, help, toast, markdown</span>
+  &#9474;    &#9492;&#9472; command_palette.rs
+  &#9474;
+  &#9492;&#9472; <span class="c">core/</span>
+       &#9500;&#9472; <span class="c">agent_config.rs</span>   <span class="m">AgentKind::{Pty, Native}</span>
+       &#9500;&#9472; <span class="c">flight.rs</span>         <span class="m">Flight / Milestone / Task</span>
+       &#9500;&#9472; <span class="c">orchestrator.rs</span>   <span class="m">tick() &rarr; Vec&lt;TaskDispatch&gt;</span>
+       &#9500;&#9472; <span class="c">pty.rs</span>            <span class="m">PtyManager, PtyEvent (reused by native)</span>
+       &#9500;&#9472; <span class="c">provider_config.rs</span><span class="m">ProviderConfig + keyring helpers</span>
+       &#9492;&#9472; <span class="c">native/</span>
+            &#9500;&#9472; conversation.rs    <span class="m">Message with parts</span>
+            &#9500;&#9472; provider/          <span class="m">Provider trait + Anthropic SSE client</span>
+            &#9500;&#9472; tool/              <span class="m">read, write, edit, bash, grep, glob</span>
+            &#9500;&#9472; runner.rs          <span class="m">Flight-mode runner</span>
+            &#9500;&#9472; chat.rs            <span class="m">Interactive chat driver</span>
+            &#9500;&#9472; compaction.rs      <span class="m">180k / 40k budget pruner</span>
+            &#9492;&#9472; safety.rs          <span class="m">doom-loop detector</span></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="eyebrow">Design choices</span>Additive, not revolutionary.</h2>
+    <p class="lede">
+      The native-agent stack is a new module. Everything downstream &mdash; the Flight data
+      model, the Sessions view, the PTY output parsing, the persistence layer &mdash; stays
+      exactly the same. Adding a new agent backend is one enum variant and one match arm.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <div class="tag">Invariant 1</div>
+        <h3>One dispatch point</h3>
+        <p>
+          <code>Orchestrator::tick()</code> is the single place where Flights become work.
+          New backends slot in as enum variants on <code>TaskDispatch</code>.
+        </p>
+      </div>
+      <div class="card">
+        <div class="tag">Invariant 2</div>
+        <h3>Event channel reuse</h3>
+        <p>
+          The native runner emits <code>PtyEvent::Output</code> and <code>PtyEvent::Exit</code> over
+          the same <code>mpsc</code> the TUI already drains. The Sessions view doesn't know
+          where the bytes came from.
+        </p>
+      </div>
+      <div class="card">
+        <div class="tag">Invariant 3</div>
+        <h3>Keyring-only secrets</h3>
+        <p>
+          No <code>api_key</code> field anywhere in the persisted model. Keys live in the
+          OS keyring; in-memory copies are <code>Zeroizing&lt;String&gt;</code> and
+          <code>Drop</code>-zeroed on form close.
+        </p>
+      </div>
+      <div class="card">
+        <div class="tag">Invariant 4</div>
+        <h3>Approval as a channel</h3>
+        <p>
+          When a tool needs approval, the chat driver sends an <code>ApprovalQuery</code> with
+          a <code>oneshot::Sender&lt;bool&gt;</code>, then awaits up to 300s. The app drains the
+          channel, shows the banner, intercepts <kbd>y</kbd>/<kbd>n</kbd>, and sends the
+          decision back.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2><span class="eyebrow">Roadmap</span>What's next.</h2>
+    <p class="lede">
+      v0.2 is the first cut with the new native-agent stack. The follow-ups below are
+      intentionally deferred &mdash; the architecture is already set up for them.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <div class="tag">v0.3</div>
+        <h3>More providers</h3>
+        <p>OpenAI and Google behind the existing <code>Provider</code> trait. Optional local models via Ollama.</p>
+      </div>
+      <div class="card">
+        <div class="tag">v0.3</div>
+        <h3>More tools</h3>
+        <p><code>webfetch</code>, <code>multiedit</code>, <code>apply_patch</code>, plus an LSP bridge for type-aware edits.</p>
+      </div>
+      <div class="card">
+        <div class="tag">v0.3</div>
+        <h3>MCP client</h3>
+        <p>Talk to any Model Context Protocol server; registered tools flow into the existing <code>ToolRegistry</code>.</p>
+      </div>
+      <div class="card">
+        <div class="tag">Polish</div>
+        <h3>Data-dir rename</h3>
+        <p>Move state from <code>~/.packetcode/</code> to <code>~/.flightdeck/</code> with a one-time migration.</p>
+      </div>
+      <div class="card">
+        <div class="tag">Polish</div>
+        <h3>Real cancellation</h3>
+        <p>A cancellation channel into the chat thread so <kbd>Ctrl+C</kbd> during a turn actually kills the provider stream.</p>
+      </div>
+      <div class="card">
+        <div class="tag">Polish</div>
+        <h3>Runner provider injection</h3>
+        <p>Refactor the Flight-mode runner to take a <code>Provider</code> trait object, matching chat-mode &mdash; so Flight tests can use <code>MockProvider</code> too.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div><span class="mono">flightdeck</span> &middot;
+      <a href="https://github.com/packetloss404/flightdeck">github.com/packetloss404/flightdeck</a>
+      &middot; Apache-2.0
+    </div>
+    <div class="disclaimer">
+      Forked from <a href="https://github.com/packetloss404/PacketCode">PacketCode</a> at
+      <span class="mono">8f2fdff</span>. FlightDeck is independent and evolves on its own cadence.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
